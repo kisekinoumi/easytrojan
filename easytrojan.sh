@@ -1,35 +1,46 @@
 #!/bin/bash
 #
 # Notes: EasyTrojan for CentOS/RedHat 7+ Debian 9+ and Ubuntu 16+
+# Modified for IPv6-only VPS
 #
 # Project home page:
 #        https://github.com/eastmaple/easytrojan
 
 trojan_passwd=$1
-caddy_domain=$2
-address_ip=$(curl ipv4.ip.sb)
-nip_domain=${address_ip}.nip.io
+caddy_domain="legend.250606.xyz"
+address_ipv6=$(curl -s -6 https://ipv6.icanhazip.com)
 check_port=$(ss -Hlnp sport = :80 or sport = :443)
 
 [ "$trojan_passwd" = "" ] && { echo "Error: You must enter a trojan's password to run this script"; exit 1; }
-[ "$caddy_domain" != "" ] && domain_ip=$(ping "${caddy_domain}" -c 1 | sed '1{s/[^(]*(//;s/).*//;q}') && [ "$domain_ip" != "$address_ip" ] && { echo "Error: Could not resolve hostname"; exit 1; }
 [ "$(id -u)" != "0" ] && { echo "Error: You must be root to run this script"; exit 1; }
 [ "$check_port" != "" ] && { echo "Error: Port 80 or 443 is already in use"; exit 1; }
 
+# Verify domain resolves to the server's IPv6 address
+if ! host -t AAAA "$caddy_domain" | grep -q "$address_ipv6"; then
+    echo "Warning: Your domain $caddy_domain doesn't resolve to this server's IPv6 address ($address_ipv6)"
+    echo "Please make sure you've set up the AAAA record correctly before continuing."
+    read -p "Continue anyway? (y/n): " confirm
+    [ "$confirm" != "y" ] && { echo "Installation aborted"; exit 1; }
+fi
+
 check_cmd () { command -v "$1" &>/dev/null; }
 
-if ! check_cmd tar; then
-    echo "tar: command not found, installing..."
-    if check_cmd yum; then
-        yum install -y tar
-    elif check_cmd apt-get; then
-        apt-get install -y tar
-    elif check_cmd dnf; then
-        dnf install -y tar
-    else
-        echo "Error: Unable to install tar"; exit 1
+# Install required packages
+for cmd in tar host curl; do
+    if ! check_cmd $cmd; then
+        echo "$cmd: command not found, installing..."
+        if check_cmd yum; then
+            yum install -y $cmd bind-utils
+        elif check_cmd apt-get; then
+            apt-get update
+            apt-get install -y $cmd dnsutils
+        elif check_cmd dnf; then
+            dnf install -y $cmd bind-utils
+        else
+            echo "Error: Unable to install $cmd"; exit 1
+        fi
     fi
-fi
+done
 
 case $(uname -m) in
     x86_64)
@@ -50,8 +61,10 @@ if ! id caddy &>/dev/null; then groupadd --system caddy; useradd --system -g cad
 
 mkdir -p /etc/caddy/trojan && chown -R caddy:caddy /etc/caddy && chmod 700 /etc/caddy
 
-[ "$caddy_domain" != "" ] && nip_domain=$caddy_domain && rm -rf /etc/caddy/certificates
+# Remove old certificates if they exist
+rm -rf /etc/caddy/certificates
 
+# Configure Caddy with IPv6 support
 cat > /etc/caddy/Caddyfile <<EOF
 {
     order trojan before respond
@@ -70,9 +83,9 @@ cat > /etc/caddy/Caddyfile <<EOF
         no_proxy
     }
 }
-:443, $nip_domain {
-    tls $address_ip@nip.io {
-        protocols tls1.2 tls1.2
+:443, $caddy_domain {
+    tls {
+        protocols tls1.2 tls1.3
         ciphers TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
     }
     log {
@@ -114,9 +127,11 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 EOF
 
+# Make sure loopback interface is up
 if ip link show lo | grep -q DOWN; then ip link set lo up; fi
 systemctl daemon-reload && systemctl restart caddy.service && systemctl enable caddy.service
 
+# Add trojan user
 curl -X POST -H "Content-Type: application/json" -d "{\"password\": \"$trojan_passwd\"}" http://127.0.0.1:2019/trojan/users/add
 echo "$trojan_passwd" >> /etc/caddy/trojan/passwd.txt && sort /etc/caddy/trojan/passwd.txt | uniq > /etc/caddy/trojan/passwd.tmp && mv -f /etc/caddy/trojan/passwd.tmp /etc/caddy/trojan/passwd.txt
 
@@ -131,6 +146,7 @@ done
 
 [ "$sslfail" = "1" ] && { echo "Certificate application failed, please check your server firewall and network settings"; exit 1; }
 
+# System optimization
 sed -i '/^# End of file/,$d' /etc/security/limits.conf
 
 cat >> /etc/security/limits.conf <<EOF
@@ -193,6 +209,8 @@ sed -i '/net.ipv4.conf.all.forwarding/d' /etc/sysctl.conf
 sed -i '/net.ipv4.conf.default.forwarding/d' /etc/sysctl.conf
 sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
 sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+sed -i '/net.ipv6.conf.all.forwarding/d' /etc/sysctl.conf
+sed -i '/net.ipv6.conf.default.forwarding/d' /etc/sysctl.conf
 
 cat >> /etc/sysctl.conf << EOF
 fs.file-max = 1048576
@@ -232,6 +250,9 @@ net.ipv4.conf.all.route_localnet = 1
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
+# IPv6 forwarding
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.default.forwarding = 1
 EOF
 
 modprobe tcp_bbr &>/dev/null
@@ -242,9 +263,15 @@ fi
 
 sysctl -p
 
-check_http=$(curl -L http://"$nip_domain")
-[ "$check_http" != "Service Unavailable" ] && { echo "You have installed EasyTrojan 2.0,please enable TCP port 80 and 443"; exit 1; }
+# Check if service is running
+if ! curl -s -o /dev/null -w "%{http_code}" "http://$caddy_domain" | grep -q "301\|503"; then
+    echo "Warning: HTTP service check failed. Please make sure ports 80 and 443 are open in your firewall."
+    echo "You may need to run: ip6tables -A INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT"
+    echo "And for permanent changes: apt install -y iptables-persistent netfilter-persistent"
+fi
 
 clear
 
-echo "You have successfully installed EasyTrojan 2.0" && echo "Address: $nip_domain | Port: 443 | Password: $trojan_passwd | Alpn: h2,http/1.1"
+echo "You have successfully installed EasyTrojan 2.0 with IPv6 support"
+echo "Address: $caddy_domain | Port: 443 | Password: $trojan_passwd | Alpn: h2,http/1.1"
+echo "IPv6 Address: [$address_ipv6]"
